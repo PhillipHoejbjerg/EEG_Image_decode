@@ -291,3 +291,141 @@ class FullGatherLayer(torch.autograd.Function):
         all_gradients = torch.stack(grads)
         dist.all_reduce(all_gradients)
         return all_gradients[dist.get_rank()]
+    
+
+import torch.nn.functional as F
+
+class SoftContrastiveLoss(torch.nn.Module):
+    def __init__(self, temperature=0.07):
+        """
+        Soft Contrastive Loss with dynamically computed soft negatives.
+        
+        :param temperature: Temperature scaling parameter for softmax.
+        """
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, projections, targets):
+        """
+        Compute the Soft Contrastive Loss.
+
+        :param projections: (batch_size, embedding_dim) - New modality embeddings.
+        :param targets: (batch_size, embedding_dim) - Corresponding embeddings in the existing space.
+        :return: Scalar loss value.
+        """
+        batch_size = projections.shape[0]
+
+        # Normalize both embeddings
+        projections = F.normalize(projections, dim=-1)
+        targets = F.normalize(targets, dim=-1)
+
+        # Compute cosine similarity matrix (between new modality and existing space)
+        sim_matrix = torch.matmul(projections, targets.T)  # (batch_size, batch_size)
+
+        # Compute cosine similarity within the existing space (to identify soft negatives)
+        existing_similarity = torch.matmul(targets, targets.T)  # (batch_size, batch_size)
+
+        # Compute soft negative weights: w_ij = 1 - sim(existing_i, existing_j)
+        soft_negative_weights = 1 - existing_similarity  # (batch_size, batch_size)
+
+        # Apply temperature scaling and softmax for contrastive loss
+        exp_logits = torch.exp(sim_matrix / self.temperature)
+
+        # Compute weighted sum of negatives
+        weighted_negatives = (exp_logits * soft_negative_weights).sum(dim=1)
+
+        # Compute final Soft Contrastive Loss
+        loss = -torch.log(exp_logits.diag() / (weighted_negatives + exp_logits.diag()))
+
+        return loss.mean()
+    
+
+
+class HybridSoftContrastiveLoss(torch.nn.Module):
+    def __init__(self, temperature=0.07, lambda_cosine=0.5, lambda_mse=0.5):
+        """
+        Soft Contrastive Loss using both Cosine Similarity and MSE for hybrid alignment.
+
+        :param temperature: Temperature scaling for softmax.
+        :param lambda_cosine: Weight for cosine similarity component.
+        :param lambda_mse: Weight for MSE-based similarity component.
+        """
+        super().__init__()
+        self.temperature = temperature
+        self.lambda_cosine = lambda_cosine
+        self.lambda_mse = lambda_mse
+
+    def forward(self, projections, targets):
+        """
+        Compute the Hybrid Soft Contrastive Loss.
+
+        :param projections: Tensor of shape (batch_size, embedding_dim) - New modality embeddings.
+        :param targets: Tensor of shape (batch_size, embedding_dim) - Corresponding embeddings in the existing space.
+        :return: Scalar loss value.
+        """
+        batch_size, embedding_dim = projections.shape  # (batch_size, embedding_dim)
+
+        # Normalize embeddings to ensure cosine similarity is valid
+        projections_norm = F.normalize(projections, dim=-1)  # Shape: (batch_size, embedding_dim)
+        targets_norm = F.normalize(targets, dim=-1)  # Shape: (batch_size, embedding_dim)
+
+        # Compute Cosine Similarity matrix (between new modality and existing space)
+        cosine_sim_matrix = torch.matmul(projections_norm, targets_norm.T)  
+        # Shape: (batch_size, batch_size) - Cosine similarity between each projection and each target
+
+        # Compute MSE Similarity: Convert MSE distance into a similarity score
+        mse_distance_matrix = torch.cdist(projections, targets, p=2)  
+        # Shape: (batch_size, batch_size) - Pairwise L2 distance between new modality and existing embeddings
+
+        mse_sim_matrix = 1 - mse_distance_matrix / mse_distance_matrix.max()  
+        # Shape: (batch_size, batch_size) - Normalize distances into [0,1] similarity scores
+
+        # Compute Hybrid Similarity matrix (weighted combination of Cosine and MSE similarity)
+        hybrid_sim_matrix = self.lambda_cosine * cosine_sim_matrix + self.lambda_mse * mse_sim_matrix  
+        # Shape: (batch_size, batch_size) - Hybrid similarity score
+
+        ### Compute soft negative weights based on existing space similarity ###
+
+        # Don't weigh the score based on existing space if batch size is 1
+        if hybrid_sim_matrix.numel() == 1:  # test case with batch size == 1
+            soft_negative_weights = torch.tensor([[1.0]]).to(hybrid_sim_matrix.device)
+
+        else:
+            # Cosine similarity within the existing space
+            existing_cosine_similarity = torch.matmul(targets_norm, targets_norm.T)  
+            # Shape: (batch_size, batch_size) - Cosine similarity between existing embeddings
+
+            # Compute pairwise MSE distance in the existing space
+            existing_mse_distance = torch.cdist(targets, targets, p=2)  
+            # Shape: (batch_size, batch_size) - L2 distance between existing embeddings
+
+            # Convert MSE distances into similarity scores
+            if existing_mse_distance.numel() == 1:  # If only one element
+                existing_mse_sim = torch.tensor([[1.0]]).to(existing_mse_distance.device)
+            else:
+                existing_mse_sim = 1 - existing_mse_distance / existing_mse_distance.max()  
+            # Shape: (batch_size, batch_size) - MSE-based similarity in existing space
+
+            # Compute hybrid similarity within the existing space
+            existing_hybrid_similarity = self.lambda_cosine * existing_cosine_similarity + self.lambda_mse * existing_mse_sim  
+            # Shape: (batch_size, batch_size) - Hybrid similarity score in existing space
+
+            # Compute soft negative weights: w_ij = 1 - HybridSim(existing_i, existing_j)
+            soft_negative_weights = 1 - existing_hybrid_similarity  
+            # Shape: (batch_size, batch_size) - Determines how much each negative sample contributes
+
+        ### Compute the Contrastive Loss ###
+
+        # Apply temperature scaling
+        exp_logits = torch.exp(hybrid_sim_matrix / self.temperature)  
+        # Shape: (batch_size, batch_size) - Exponentiated similarity scores
+
+        # Compute weighted sum of negatives
+        weighted_negatives = (exp_logits * soft_negative_weights).sum(dim=1)  
+        # Shape: (batch_size,) - Summed negative scores for each sample
+
+        # Compute final Soft Contrastive Loss
+        loss = -torch.log(exp_logits.diag() / (weighted_negatives + exp_logits.diag()))  
+        # Shape: (batch_size,) - Contrastive loss for each sample
+
+        return loss.mean()  # Scalar loss value

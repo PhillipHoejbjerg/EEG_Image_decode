@@ -74,7 +74,7 @@ def train_clip_aligner(sub, eeg_model, dataloader, optimizer, epoch, device, tex
     }
 
     # initialize 
-    total_loss, total_size, correct = 0, 0, 0 
+    total_loss, total_size, correct, total_MSE = 0, 0, 0, 0 
     features_list = []  # List to store features
 
     for batch_idx, (eeg_data, labels, text, text_features, img, img_features) in enumerate(dataloader):
@@ -96,6 +96,9 @@ def train_clip_aligner(sub, eeg_model, dataloader, optimizer, epoch, device, tex
         logit_scale = eeg_model.logit_scale # a learnable parameter
         features_list.append(clip_eeg_emb)
 
+        # MSE calculation
+        total_MSE += mse_loss_fn(clip_eeg_emb, clip_emb).item()
+
         # loss_func: --> clip_loss()
         if args.loss_fn == 'clip':
             clip_loss = eeg_model.loss_func(clip_eeg_emb, clip_emb, logit_scale)
@@ -111,7 +114,7 @@ def train_clip_aligner(sub, eeg_model, dataloader, optimizer, epoch, device, tex
             # Measure similarity between EEG embeddings and CLIP image embeddings - to get actual prediction, and thereby accuracy. NOT needed for training
             logits_img = logit_scale * clip_eeg_emb @ all_clip_emb[args.atms_target].T
 
-        elif args.loss_fn == 'vicreg':
+        elif args.loss_fn == 'vicreg' or args.loss_fn == 'softContrastive' or args.loss_fn == 'softHybridContrastive':
             loss = eeg_model.loss_func(clip_eeg_emb, clip_emb)
 
             # backprop
@@ -121,6 +124,7 @@ def train_clip_aligner(sub, eeg_model, dataloader, optimizer, epoch, device, tex
             # Measure similarity between EEG embeddings and CLIP image embeddings - to get actual prediction, and thereby accuracy. NOT needed for training
             # Perhaps use logit_scale
             logits_img = clip_eeg_emb @ all_clip_emb[args.atms_target].T
+
 
         predicted = torch.argmax(logits_img, dim=1) # (n_batch, ) ∈ {0, 1, ..., n_cls-1}
     
@@ -134,8 +138,9 @@ def train_clip_aligner(sub, eeg_model, dataloader, optimizer, epoch, device, tex
     # Calculate loss and accuracy
     average_loss = total_loss / (batch_idx+1)
     accuracy = correct / total_size
+    average_MSE = total_MSE / (batch_idx+1)
 
-    return average_loss, accuracy, torch.cat(features_list, dim=0)
+    return average_loss, accuracy, torch.cat(features_list, dim=0), average_MSE
 
 def train_diffusion_prior(sub, diffusion_prior, dataloader, device, args, logger):
 
@@ -169,7 +174,7 @@ def evaluate_model(sub, eeg_model, dataloader, device, all_clip_text_emb, all_cl
     
     # initialize 
     all_labels = set(range(all_clip_emb['text'].size(0)))
-    total_loss, total_size, correct, top5_acc, top5_correct_count = 0, 0, 0, 0, 0
+    total_loss, total_size, correct, top5_acc, top5_correct_count, total_MSE = 0, 0, 0, 0, 0, 0
 
     features_list = []
 
@@ -195,6 +200,9 @@ def evaluate_model(sub, eeg_model, dataloader, device, all_clip_text_emb, all_cl
             clip_eeg_emb = eeg_model(eeg_data, subject_ids).float()
             logit_scale = eeg_model.logit_scale
             features_list.append(clip_eeg_emb)
+
+            # MSE calculation
+            total_MSE += mse_loss_fn(clip_eeg_emb, clip_emb).item()
                 
             # loss_func: --> clip_loss()
             if args.loss_fn == 'clip':
@@ -207,7 +215,7 @@ def evaluate_model(sub, eeg_model, dataloader, device, all_clip_text_emb, all_cl
                 
                 # Measure similarity between EEG embeddings and CLIP image embeddings - to get actual prediction, and thereby accuracy. NOT needed for training
 
-            elif args.loss_fn == 'vicreg':
+            elif args.loss_fn == 'vicreg' or args.loss_fn == 'softContrastive' or args.loss_fn == 'softHybridContrastive':
                 loss = eeg_model.loss_func(clip_eeg_emb, clip_emb)
 
                 total_loss += loss.item()
@@ -245,8 +253,9 @@ def evaluate_model(sub, eeg_model, dataloader, device, all_clip_text_emb, all_cl
     average_loss = total_loss / (batch_idx+1)
     accuracy = correct / total_size
     top5_acc = top5_correct_count / total_size
+    average_MSE = total_MSE / (batch_idx+1)
 
-    return average_loss, accuracy, top5_acc, features_list
+    return average_loss, accuracy, top5_acc, features_list, average_MSE
 
 
 def evaluate_and_append_results(sub, eeg_model, test_loader, device, test_dataset, args, 
@@ -254,28 +263,28 @@ def evaluate_and_append_results(sub, eeg_model, test_loader, device, test_datase
                                 logger):
     
     # Evaluate the model for various values of k
-    test_loss, test_accuracy, top5_acc, features_list = evaluate_model(sub, eeg_model, test_loader, device, 
+    test_loss, test_accuracy, top5_acc, features_list, average_MSE = evaluate_model(sub, eeg_model, test_loader, device, 
                                                         test_dataset.text_features, 
                                                         test_dataset.img_features, k=200, args=args)
     
     # TODO: Possibly just reuse "features_list" for remaining scripts
-    _, v2_acc, _, _ = evaluate_model(sub, eeg_model, test_loader, device, 
+    _, v2_acc, _, _, _ = evaluate_model(sub, eeg_model, test_loader, device, 
                                   test_dataset.text_features, 
                                   test_dataset.img_features, k=2, args=args)
     
-    _, v4_acc, _, _ = evaluate_model(sub, eeg_model, test_loader, device, 
+    _, v4_acc, _, _, _ = evaluate_model(sub, eeg_model, test_loader, device, 
                                   test_dataset.text_features, 
                                   test_dataset.img_features, k=4, args=args)
     
-    _, v10_acc, _, _ = evaluate_model(sub, eeg_model, test_loader, device, 
+    _, v10_acc, _, _, _ = evaluate_model(sub, eeg_model, test_loader, device, 
                                    test_dataset.text_features, 
                                    test_dataset.img_features, k=10, args=args)
     
-    _, v50_acc, v50_top5_acc, _ = evaluate_model(sub, eeg_model, test_loader, device, 
+    _, v50_acc, v50_top5_acc, _, _ = evaluate_model(sub, eeg_model, test_loader, device, 
                                               test_dataset.text_features, 
                                               test_dataset.img_features, k=50, args=args)
     
-    _, v100_acc, v100_top5_acc, _ = evaluate_model(sub, eeg_model, test_loader, device, 
+    _, v100_acc, v100_top5_acc, _, _ = evaluate_model(sub, eeg_model, test_loader, device, 
                                                 test_dataset.text_features, 
                                                 test_dataset.img_features, k=100, args=args)
 
@@ -298,7 +307,8 @@ def evaluate_and_append_results(sub, eeg_model, test_loader, device, test_datase
         "v50_acc": v50_acc,
         "v100_acc": v100_acc,
         "v50_top5_acc": v50_top5_acc,
-        "v100_top5_acc": v100_top5_acc
+        "v100_top5_acc": v100_top5_acc,
+        "test_MSE": average_MSE
     }
 
     logger.log(epoch_results)
@@ -424,7 +434,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_diffusion_prior', action='store_true', help='Trains the diffusion prior to the pipeline')
 
     # Loss
-    parser.add_argument('--loss_fn', type=str, choices=['clip', 'vicreg'], default='clip', help='loss function, see loss.py for more info')
+    parser.add_argument('--loss_fn', type=str, choices=['clip', 'vicreg', 'softContrastive', 'softHybridContrastive'], default='clip', help='loss function, see loss.py for more info')
     
     # VICReg loss arguments
     parser.add_argument("--sim-coeff", type=float, default=25.0,
@@ -522,14 +532,14 @@ if __name__ == '__main__':
             for epoch in tqdm(range(args.epochs), desc = "Epoch"):
                 
                 # Train one epoch
-                train_loss, train_accuracy, _ = train_clip_aligner(sub, eeg_model, clip_loaders['train'], optimizer, epoch, device, clip_dataset['train'].text_features, clip_dataset['train'].img_features, args=args)
+                train_loss, train_accuracy, _, average_MSE = train_clip_aligner(sub, eeg_model, clip_loaders['train'], optimizer, epoch, device, clip_dataset['train'].text_features, clip_dataset['train'].img_features, args=args)
                 # save train losses
                 train_losses.append(train_loss)
                 train_accuracies.append(train_accuracy)
 
                 # Evaluate model
                 epoch_results, _ = evaluate_and_append_results(sub, eeg_model, clip_loaders['test'], device, clip_dataset['test'], args, test_losses, test_accuracies, v2_accs, v4_accs, v10_accs, epoch, logger=logger)
-                epoch_results['train_loss'], epoch_results['train_accuracy'] = train_loss, train_accuracy
+                epoch_results['train_loss'], epoch_results['train_accuracy'], epoch_results['train_MSE'] = train_loss, train_accuracy, average_MSE
                 logger.log(epoch_results)
 
                 # If the test accuracy of the current epoch is the best, save the model and related information

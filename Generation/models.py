@@ -35,7 +35,7 @@ from subject_layers.Transformer_EncDec import Encoder, EncoderLayer
 from subject_layers.SelfAttention_Family import FullAttention, AttentionLayer
 from subject_layers.Embed import DataEmbedding
 import numpy as np
-from loss import ClipLoss, VICReg_loss
+from loss import ClipLoss, VICReg_loss, SoftContrastiveLoss, HybridSoftContrastiveLoss
 import argparse
 from torch import nn
 from torch.optim import AdamW
@@ -179,6 +179,13 @@ class ATMS(nn.Module):
         elif self.args.loss_fn == 'vicreg':
 
             self.loss_func = VICReg_loss(args = self.args)
+
+        elif self.args.loss_fn == 'softContrastive':
+            self.loss_func = SoftContrastiveLoss(temperature=0.07)
+
+        elif self.args.loss_fn == 'softHybridContrastive':
+            self.loss_func = HybridSoftContrastiveLoss(temperature=0.07, lambda_cosine=0.5, lambda_mse=0.5)
+
          
     def forward(self, x, subject_ids):
         x = self.encoder(x, None, subject_ids)
