@@ -266,7 +266,7 @@ def load_best_model(eeg_model, sub, device, args):
 
     # Getting output from the best model
     PATH = f"{args.model_dir}/{args.name}/{sub}" if args.insubject else f"{args.model_dir}/{args.name}/across"
-    eeg_model.load_state_dict(torch.load(f"{PATH}/best_val.pth", weights_only=False, map_location=torch.device(device)))
+    eeg_model.load_state_dict(torch.load(f"{PATH}/{args.pth_name}.pth", weights_only=False, map_location=torch.device(device)))
     # Freezing the original embedder
     if args.freeze_ATMS:
         # Freeze the parameters of the original model
@@ -768,6 +768,8 @@ if __name__ == '__main__':
     parser.add_argument('--data_path', type=str, default="/work3/s184984/repos/EEG_Image_decode/eeg_dataset/Preprocessed_data_250Hz", help='Path to the EEG dataset')
     parser.add_argument('--model_dir', type=str, default='./models/EEG_encoder', help='Directory to save output results')    
     parser.add_argument('--seed', type=int, default=42, help='Number of epochs')
+
+    parser.add_argument('--pth_name', type=str, default='best', help='Name of the ATMS model to load')
 
     # Model params
     parser.add_argument('--device', type=str, choices=['cpu', 'cuda', 'mps'], default='gpu', help='Device to run on (cpu or gpu)')    
