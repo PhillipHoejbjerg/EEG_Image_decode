@@ -453,7 +453,7 @@ def plot_PCA(train_pca, val_results, pca, epoch, save_to_wandb):
     x_1_2d = pca.transform(val_results['x_1_all'].numpy())
     x_1_hat_2d = pca.transform(val_results['x_1_hat_all'].numpy())
 
-    save_dir = f'/Users/pchho/Documents/repos/EEG_Image_decode/Generation/phd_results/flow_PCA/epoch_{epoch:03d}'
+    save_dir = f'./phd_results/flow_PCA/epoch_{epoch:03d}'
     os.makedirs(save_dir, exist_ok=True)
 
     plt.figure(figsize=(6, 6))
