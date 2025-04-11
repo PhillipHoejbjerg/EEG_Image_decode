@@ -770,7 +770,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42, help='Number of epochs')
 
     # Model params
-    parser.add_argument('--device', type=str, choices=['cpu', 'gpu', 'mps'], default='gpu', help='Device to run on (cpu or gpu)')    
+    parser.add_argument('--device', type=str, choices=['cpu', 'cuda', 'mps'], default='gpu', help='Device to run on (cpu or gpu)')    
     parser.add_argument('--subjects', nargs='+', default=['sub-01', 'sub-02', 'sub-03', 'sub-04', 'sub-05', 'sub-06', 'sub-07', 'sub-08', 'sub-09', 'sub-10'], help='List of subject IDs (default: sub-01 to sub-10)')  
     parser.add_argument('--insubject', type=bool, default=True, help='In-subject mode or cross-subject mode')
     parser.add_argument('--alpha', type=float, default=0.90, help='alpha value to weigh the loss')
