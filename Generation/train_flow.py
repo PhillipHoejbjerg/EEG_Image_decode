@@ -3,7 +3,16 @@ import torch
 import argparse
 import os
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
+import torch.nn.functional as F
+from torchdiffeq import odeint # For flow solving
+import torch.nn as nn
+from flow_matching.path import CondOTProbPath
+
+from flow_unet import FlowUNet1D
+from flow_mlp import ResMLPFlow
+from flow_transformer import TransformerFlow
+
 import itertools
 
 from tqdm import tqdm
@@ -13,11 +22,15 @@ from util import wandb_logger
 from utils_phil import extract_id_from_string, set_seed
 from eegdatasets_leaveone import EEGDataset
 
+import matplotlib.pyplot as plt
 
 from models import ATMS
+from normalizer import Normalizer
+
+import io
 
 
-def load_CLIP_loaders(args, sub, device):
+def load_ATMS_loaders(args, sub, device):
     # Placeholder function to load EEG dataset
     # Replace with actual data loading logic
     print(f"Loading EEG dataset for subject {sub} on device {device}")
@@ -37,6 +50,48 @@ def load_CLIP_loaders(args, sub, device):
                         'test': DataLoader(clip_dataset['test'], batch_size=1, shuffle=False, num_workers=0, drop_last=True)}    
     
     return clip_dataset, clip_loaders
+
+def load_FLOW_loaders(args, sub, device, clip_loaders, eeg_model, split=None, reconstruction = False):
+    def build_dataset(split_key):
+        dataset = clip_loaders[split_key].dataset
+
+        eeg_embs = torch.cat([
+            eeg_model(
+                ele[0].unsqueeze(0).to(device),
+                torch.tensor([extract_id_from_string(sub)], dtype=torch.long).to(device)
+            ) for ele in tqdm(dataset)
+        ], axis=0)
+
+        if args.diffusion_target == 'image':
+            clip_embs = dataset.img_features.view(1654, 10, 1, 1024).repeat(1, 1, 4, 1).view(-1, 1024) if split_key == 'train' else dataset.img_features
+        else:
+            clip_embs = dataset.text_features.view(1654, 1, 1, 1024).repeat(1, 10, 4, 1).view(-1, 1024) if split_key == 'train' else dataset.text_features
+
+        return EmbeddingDataset(
+            clip_eeg_embeddings=eeg_embs,
+            clip_embeddings=clip_embs,
+            labels=dataset.labels,
+            img_paths = dataset.img if split_key == 'test' else np.repeat(dataset.img, 4).tolist() # Repeat images per training instance
+        )
+
+    stage2_dataset = {}
+    stage2_loaders = {}
+
+    with torch.no_grad():
+        
+        splits = ['train', 'test'] if split is None else [split]
+
+        for s in splits:
+            stage2_dataset[s] = build_dataset(s)
+            stage2_loaders[s] = DataLoader(
+                stage2_dataset[s],
+                batch_size= 1 if reconstruction else args.flow_batch_size,
+                shuffle=(s == 'train'),
+                num_workers=0
+            )
+
+    return stage2_loaders
+    
 
 
 # Train model function
@@ -71,8 +126,6 @@ def train_clip_aligner(sub, eeg_model, dataloader, optimizer, device, text_featu
         clip_emb = locals()[feature_mapping[args.atms_target]].to(device).float()
         labels = labels.to(device)
         
-        optimizer.zero_grad()
-        
         batch_size = eeg_data.size(0)  # Assume the first element is the data tensor
         subject_ids = torch.full((batch_size,), extract_id_from_string(sub), dtype=torch.long).to(device)
 
@@ -92,6 +145,7 @@ def train_clip_aligner(sub, eeg_model, dataloader, optimizer, device, text_featu
             loss = (10 * (args.alpha * mse_loss) + (10 * ((1 - args.alpha) * clip_loss)))
             
             # backprop
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
@@ -102,6 +156,7 @@ def train_clip_aligner(sub, eeg_model, dataloader, optimizer, device, text_featu
             loss = eeg_model.loss_func(clip_eeg_emb, clip_emb)
 
             # backprop
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
@@ -206,11 +261,12 @@ def validate_clip_aligner(sub, eeg_model, test_loader, device, test_dataset, arg
 
     return epoch_results
 
-def load_best_model(eeg_model, args):
+# TODO: REMEMBER WE'RE NOW DOING BEST VALIDATION NOT BEST RETRIEVAL!!!
+def load_best_model(eeg_model, sub, device, args):
 
     # Getting output from the best model
-    PATH = f"{args.model_dir}/{sub}/{args.name}" if args.insubject else f"{args.model_dir}/across/{args.name}"
-    eeg_model.load_state_dict(torch.load(f"{PATH}/best.pth", weights_only=False, map_location=torch.device(device)))
+    PATH = f"{args.model_dir}/{args.name}/{sub}" if args.insubject else f"{args.model_dir}/{args.name}/across"
+    eeg_model.load_state_dict(torch.load(f"{PATH}/best_val.pth", weights_only=False, map_location=torch.device(device)))
     # Freezing the original embedder
     if args.freeze_ATMS:
         # Freeze the parameters of the original model
@@ -220,44 +276,27 @@ def load_best_model(eeg_model, args):
 
     return eeg_model
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-class FlowMatchingMLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim=512, time_embed_dim=64):
-        super().__init__()
+# -- Flow matching --
+def skewed_timestep_sample(num_samples: int, device: torch.device) -> torch.Tensor:
+    P_mean = -1.2
+    P_std = 1.2
+    rnd_normal = torch.randn((num_samples,), device=device)
+    sigma = (rnd_normal * P_std + P_mean).exp()
+    time = 1 / (1 + sigma)
+    time = torch.clip(time, min=0.0001, max=1.0)
+    return time
 
-        # Time embedding: you can use sinusoidal encoding or a learnable MLP
-        self.time_mlp = nn.Sequential(
-            nn.Linear(1, time_embed_dim),
-            nn.ReLU(),
-            nn.Linear(time_embed_dim, time_embed_dim)
-        )
 
-        self.net = nn.Sequential(
-            nn.Linear(input_dim + time_embed_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)  # Output: velocity vector
-        )
+from torch import Tensor
 
-    def forward(self, x, t):
-        """
-        x: tensor of shape (batch_size, input_dim) → current x(t)
-        t: tensor of shape (batch_size, 1) → time step
-        """
-        t_embed = self.time_mlp(t)                  # (B, time_embed_dim)
-        xt = torch.cat([x, t_embed], dim=-1)        # Concatenate time and input
-        return self.net(xt) 
-
-from torch.utils.data import Dataset
 class EmbeddingDataset(Dataset):
 
-    def __init__(self, clip_eeg_embeddings, clip_embeddings):
+    def __init__(self, clip_eeg_embeddings, clip_embeddings, labels, img_paths):
         self.clip_eeg_embeddings = clip_eeg_embeddings
         self.clip_embeddings = clip_embeddings
+        self.labels = labels,
+        self.img_paths = img_paths
 
     def __len__(self):
         return len(self.clip_eeg_embeddings)
@@ -265,31 +304,509 @@ class EmbeddingDataset(Dataset):
     def __getitem__(self, idx):
         return {
             "clip_eeg_embeddings": self.clip_eeg_embeddings[idx],
-            "clip_embeddings": self.clip_embeddings[idx]
+            "clip_embeddings": self.clip_embeddings[idx],
+            "labels": self.labels[0][idx],
+            "img_paths": self.img_paths[idx]
         } 
+    
+def process_batch(batch, is_train, epoch=None):
+    x_0 = batch['clip_eeg_embeddings'].to(device)
+    x_1 = batch['clip_embeddings'].to(device)
+    labels = batch.get('labels', None)
+    if labels is not None:
+        labels = labels.to(device)
+
+    # Normalize
+    if args.use_normalization and eeg_normalizer is not None and clip_normalizer is not None:
+        x_0 = eeg_normalizer.normalize(x_0)
+        x_1 = clip_normalizer.normalize(x_1)
+
+    if is_train:
+        batch_size = x_0.size(0)
+        t = skewed_timestep_sample(batch_size, device=device) if args.skewed_timesteps else torch.rand(batch_size, device=device)
+        sample = path.sample(t=t, x_0=x_0, x_1=x_1)
+        pred_dx = flow(sample.x_t, t)
+        loss = F.mse_loss(pred_dx, sample.dx_t)
+
+        # Optional: cosine similarity loss on endpoint
+        if args.cosine_loss_weight > 0 or args.mse_loss_weight > 0:
+
+            x_1_pred = solver.sample(
+                x_init=x_0,
+                step_size=None,
+                time_grid=torch.linspace(0, 1, steps=21).to(device),
+                method="rk4",
+                return_intermediates=False,
+                enable_grad = True
+            )
+
+            # TODO: Denormalize? - also try transformer with normalize
+            if args.cosine_loss_weight > 0:
+                cosine_sim = F.cosine_similarity(x_1_pred, x_1, dim=-1).mean()
+                cosine_loss = 1 - cosine_sim
+                loss += args.cosine_loss_weight * cosine_loss
+
+            if args.mse_loss_weight > 0:
+                mse_loss = F.mse_loss(x_1_pred, x_1)
+                loss += args.mse_loss_weight * mse_loss
+
+        return loss, {}
+
+    else:
+        # Validation mode
+        t = torch.rand(x_0.size(0), device=device)
+        sample = path.sample(t=t, x_0=x_0, x_1=x_1)
+        pred_dx = flow(sample.x_t, t)
+        val_loss = F.mse_loss(pred_dx, sample.dx_t)
+
+        x_1_pred = solver.sample(
+            x_init=x_0,
+            step_size=None,
+            time_grid=torch.linspace(0, 1, steps=21).to(device),
+            method="rk4",
+            return_intermediates=False,
+        )
+
+        if args.cosine_loss_weight > 0 or args.mse_loss_weight > 0:
+            if args.cosine_loss_weight > 0:
+                cosine_sim = F.cosine_similarity(x_1_pred, x_1, dim=-1).mean()
+                cosine_loss = 1 - cosine_sim
+                val_loss += args.cosine_loss_weight * cosine_loss
+
+            if args.mse_loss_weight > 0:
+                mse_loss = F.mse_loss(x_1_pred, x_1)
+                val_loss += args.mse_loss_weight * mse_loss  
+
+        if args.use_normalization and eeg_normalizer is not None and clip_normalizer is not None:
+            x_0 = eeg_normalizer.denormalize(x_0)
+            x_1_pred = clip_normalizer.denormalize(x_1_pred)
+            x_1 = clip_normalizer.denormalize(x_1)
+
+        return val_loss, {
+            'x_0': x_0.cpu(),
+            'x_1_true': x_1.cpu(),
+            'x_1_hat': x_1_pred.cpu(),
+            'labels': labels,
+            'x_1_hat_raw': x_1_pred,
+            'x_1_true_raw': x_1,
+        }
+
+def train_one_epoch(epoch):
+    flow.train()
+    loss_total, train_batches = 0.0, 0
+
+    for batch in flow_loaders['train']:
+        loss, _ = process_batch(batch, is_train=True, epoch=epoch)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        loss_total += loss.item()
+        train_batches += 1
+
+    return loss_total / train_batches
+
+
+def validate_one_epoch(epoch):
+    flow.eval()
+    val_loss_total = 0.0
+    inference_mse_total = 0.0
+    inference_cos_total = 0.0
+    correct, total_size, val_batches = 0, 0, 0
+    x_0_list, x_1_list, x_1_hat_list, labels = [], [], [], []
+
+    with torch.no_grad():
+        for batch in flow_loaders['test']:
+            val_loss, result = process_batch(batch, is_train=False)
+            val_loss_total += val_loss.item()
+            val_batches += 1
+
+            mse = F.mse_loss(result['x_1_hat_raw'], result['x_1_true_raw'])
+            cosine_sim = F.cosine_similarity(result['x_1_hat_raw'], result['x_1_true_raw'], dim=-1).mean()
+            inference_mse_total += mse.item()
+            inference_cos_total += cosine_sim.item()
+
+            logits = result['x_1_hat_raw'] @ clip_loaders['test'].dataset.img_features.to(device).float().T
+            predicted = torch.argmax(logits, dim=1)
+            correct += (predicted == result['labels']).sum().item()
+            total_size += result['labels'].size(0)
+
+            x_0_list.append(result['x_0'])
+            x_1_list.append(result['x_1_true'])
+            x_1_hat_list.append(result['x_1_hat'])
+            labels.append(result['labels'])
+
+    return {
+        "val_loss": val_loss_total / val_batches,
+        "inference_mse": inference_mse_total / val_batches,
+        "inference_cos": inference_cos_total / val_batches,
+        "retrieval_acc": correct / total_size,
+        "x_0_all": torch.cat(x_0_list, dim=0),
+        "x_1_all": torch.cat(x_1_list, dim=0),
+        "x_1_hat_all": torch.cat(x_1_hat_list, dim=0),
+        "labels": torch.cat(labels, dim=0),
+    }
+
+
+def plot_PCA(train_pca, val_results, pca, epoch, save_to_wandb):
+    # PCA + plot
+    x_0_2d = pca.transform(val_results['x_0_all'].numpy())
+    x_1_2d = pca.transform(val_results['x_1_all'].numpy())
+    x_1_hat_2d = pca.transform(val_results['x_1_hat_all'].numpy())
+
+    save_dir = f'/Users/pchho/Documents/repos/EEG_Image_decode/Generation/phd_results/flow_PCA/epoch_{epoch:03d}'
+    os.makedirs(save_dir, exist_ok=True)
+
+    plt.figure(figsize=(6, 6))
+    plt.scatter(train_pca[:, 0], train_pca[:, 1], c='gray', label='CLIP training features', alpha=0.1)
+    plt.scatter(x_1_2d[:, 0], x_1_2d[:, 1], c='black', label='CLIP target', alpha=0.5)
+    plt.scatter(x_0_2d[:, 0], x_0_2d[:, 1], c='blue', label='EEG (before)', alpha=0.5)
+    plt.scatter(x_1_hat_2d[:, 0], x_1_hat_2d[:, 1], c='red', label='EEG → CLIP (after)', alpha=0.5)
+
+    # Draw lines between corresponding x_1 and x_1_hat points
+    for (x1, x1_hat) in zip(x_1_2d, x_1_hat_2d):
+        plt.plot([x1[0], x1_hat[0]], [x1[1], x1_hat[1]], c='gray', linewidth=0.5, alpha=0.4)
+
+    plt.legend()
+    plt.title(f'Flow Epoch {epoch}: {val_results["retrieval_acc"]:.4f}')
+    plt.axis('off')
+    plt.tight_layout()
+    # Save locally
+    pca_path = f'{save_dir}/step.png'
+    plt.savefig(pca_path)
+
+    # Save to WandB if requested
+    if save_to_wandb:
+        wandb.log({f'PCA/pca_w_score': wandb.Image(pca_path)})
+
+    plt.close()
+
+
+import plotly.graph_objects as go
+import wandb
+"""
+def plot_PCA(train_pca, val_results, pca, epoch, save_to_wandb=False):
+    # Project into PCA space
+    x_0_2d = pca.transform(val_results['x_0_all'].cpu().numpy())
+    x_1_2d = pca.transform(val_results['x_1_all'].cpu().numpy())
+    x_1_hat_2d = pca.transform(val_results['x_1_hat_all'].cpu().numpy())
+
+    # Create Plotly figure
+    fig = go.Figure()
+
+    # Training features
+    fig.add_trace(go.Scatter(
+        x=train_pca[:, 0], y=train_pca[:, 1],
+        mode='markers',
+        marker=dict(color='gray', opacity=0.1),
+        name='CLIP training features',
+        hoverinfo='skip'
+    ))
+
+    # EEG before
+    fig.add_trace(go.Scatter(
+        x=x_0_2d[:, 0], y=x_0_2d[:, 1],
+        mode='markers',
+        marker=dict(color='blue', opacity=0.7),
+        name='EEG (before)',
+        text=val_results['labels'].cpu().tolist() if isinstance(val_results['labels'], torch.Tensor) else val_results['labels'],
+        hovertemplate='EEG (before)<br>%{text}<extra></extra>'
+    ))
+
+    # EEG after (predicted CLIP)
+    fig.add_trace(go.Scatter(
+        x=x_1_hat_2d[:, 0], y=x_1_hat_2d[:, 1],
+        mode='markers',
+        marker=dict(color='red', opacity=0.7),
+        name='EEG → CLIP (after)',
+        text=val_results['labels'].cpu().tolist() if isinstance(val_results['labels'], torch.Tensor) else val_results['labels'],
+        hovertemplate='EEG → CLIP (after)<br>%{text}<extra></extra>'
+    ))
+
+    # CLIP target
+    fig.add_trace(go.Scatter(
+        x=x_1_2d[:, 0], y=x_1_2d[:, 1],
+        mode='markers',
+        marker=dict(color='black', opacity=0.7),
+        name='CLIP target',
+        text=val_results['labels'].cpu().tolist() if isinstance(val_results['labels'], torch.Tensor) else val_results['labels'],
+        hovertemplate='CLIP target<br>%{text}<extra></extra>'
+    ))
+
+    # Connecting lines
+    for i in range(len(x_0_2d)):
+        fig.add_trace(go.Scatter(
+            x=[x_0_2d[i, 0], x_1_hat_2d[i, 0], x_1_2d[i, 0]],
+            y=[x_0_2d[i, 1], x_1_hat_2d[i, 1], x_1_2d[i, 1]],
+            mode='lines',
+            line=dict(color='rgba(100, 100, 100, 0.4)', width=1),
+            hoverinfo='skip',
+            showlegend=False
+        ))
+
+    fig.update_layout(
+        title=f'Flow Epoch {epoch}: Retrieval Acc {val_results["retrieval_acc"]:.4f}',
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        width=700,
+        height=700
+    )
+
+    # Save as HTML
+    save_dir = f'/tmp/pca_epoch_{epoch:03d}'
+    os.makedirs(save_dir, exist_ok=True)
+    html_path = os.path.join(save_dir, 'pca_interactive.html')
+    fig.write_html(html_path)
+
+    # Log to WandB
+    if save_to_wandb:
+        wandb.log({f"PCA/Interactive_Epoch": wandb.Html(html_path)})
+"""
+
+def load_best_flow_model(flow, path):
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No saved flow model found at: {path}")
+    
+    state_dict = torch.load(path, map_location=device)
+    flow.load_state_dict(state_dict)
+    flow.eval()  # Set to eval mode just in case
+    print(f"Loaded best flow model from: {path}")
+    return flow
+
+
+import wandb
+from PIL import Image
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from torchvision.transforms import ToTensor
+
+from PIL import Image
+
+def load_and_correct_image(image_path):
+    """
+    Loads an image, corrects its orientation using EXIF data, converts to RGB format, 
+    and center crops it to the largest possible square.
+    
+    Args:
+        image_path (str): Path to the image file.
+    
+    Returns:
+        PIL.Image.Image: A corrected and square-cropped PIL Image object.
+    """
+    with Image.open(image_path) as image:
+        # Correct orientation using EXIF metadata if available
+        if hasattr(image, "_getexif") and image._getexif():
+            exif = image._getexif()
+            orientation_key = 274  # Key for orientation tag
+            if exif and orientation_key in exif:
+                orientation = exif[orientation_key]
+                # Apply transformations based on orientation value
+                if orientation == 3:
+                    image = image.rotate(180, expand=True)
+                elif orientation == 6:
+                    image = image.rotate(270, expand=True)
+                elif orientation == 8:
+                    image = image.rotate(90, expand=True)
+        
+        # Convert to RGB to ensure consistent processing
+        image = image.convert("RGB")
+        
+        # Perform center square cropping
+        width, height = image.size
+        min_dim = min(width, height)
+        left = (width - min_dim) // 2
+        top = (height - min_dim) // 2
+        right = (width + min_dim) // 2
+        bottom = (height + min_dim) // 2
+        image = image.crop((left, top, right, bottom))
+    
+    return image
+
+
+from PIL import Image, ImageDraw
+
+def generate_and_log_flow_reconstructions(
+    flow_loader,
+    flow,
+    solver,
+    generator,
+    args,
+    load_and_correct_image,
+    eeg_normalizer=None,
+    clip_normalizer=None,
+    pca=None,
+    train_data_for_pca=None,
+):
+    """
+    Reconstruct and log images using flow + ODE and stable diffusion.
+    Logs a static 3-panel plot (Original, Stage 1, Final) and optionally a GIF.
+    """
+    flow.eval()
+
+    with torch.no_grad():
+        for i, batch in enumerate(flow_loader):
+            x_0 = batch['clip_eeg_embeddings'].to(device)
+            x_1 = batch['clip_embeddings'].to(device)
+            original_img_path = batch['img_paths'][0]
+
+            try:
+                original_img = load_and_correct_image(original_img_path)
+            except Exception as e:
+                print(f"Failed to load image at {original_img_path}: {e}")
+                # continue
+
+            if args.use_normalization and eeg_normalizer is not None:
+                # PCA is fitted on normalized space
+                x_0 = eeg_normalizer.normalize(x_0)
+                x_1 = clip_normalizer.normalize(x_1)
+
+            # Solve ODE flow
+            x_intermediates = solver.sample(
+                x_init=x_0,
+                step_size=None,
+                time_grid=torch.linspace(0, 1, steps=21).to(device),
+                method="rk4",
+                return_intermediates=args.log_gif_to_wandb
+            )
+
+            if not args.log_gif_to_wandb:
+                x_intermediates = [x_intermediates]
+
+            # PCA + plot
+            x_0_pca = pca.transform(x_0.cpu().numpy())
+            x_1_pca = pca.transform(x_1.cpu().numpy())
+            x_intermediates_pca = pca.transform(np.array([ele.cpu().numpy() for ele in x_intermediates]).squeeze(1))
+
+            # Generate images from latent embeddings
+            if args.use_normalization and clip_normalizer is not None:
+                # Denormalize for visualization
+                x_intermediates = [clip_normalizer.denormalize(x) for x in x_intermediates]
+
+            gif_frames = []
+            for step_idx, x_embed in enumerate(x_intermediates):
+                set_seed(args.seed)
+                img = generator.generate(image_embeds=x_embed, text_prompt="")
+                if not isinstance(img, Image.Image):
+                    img = Image.fromarray(np.array(img))
+                gif_frames.append(img)
+
+            # --- Static Plot (Original, Stage 1, Final)
+            fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+            axs[0].imshow(original_img)
+            axs[0].set_title("Original")
+            axs[0].axis('off')
+
+            axs[1].imshow(np.array(gif_frames[0]))
+            axs[1].set_title("Stage 1")
+            axs[1].axis('off')
+
+            axs[2].imshow(np.array(gif_frames[-1]))
+            axs[2].set_title("Flow-Reconstructed")
+            axs[2].axis('off')
+
+            fig.suptitle(original_img_path.split("/")[-1].replace(".jpg", ""), fontsize=14)
+            wandb.log({f"Flow Reconstruction/{i}": wandb.Image(fig)})
+            plt.close(fig)
+
+            # --- Animated GIF (Left: Original, Right: Flow Steps)
+            if args.log_gif_to_wandb:
+                gif_with_original = []
+
+                # Resize all images to same size
+                target_size = (500, 500)
+                original_resized = original_img.resize(target_size)
+
+                for step_idx, frame in enumerate(gif_frames):
+                    # Reconstruction
+                    frame_resized = frame.resize(target_size)
+                    combined = Image.new("RGB", (target_size[0] * 2, target_size[1]))
+                    combined.paste(original_resized, (0, 0))
+                    combined.paste(frame_resized, (target_size[0], 0))
+                    
+                    # PCA plot
+                    fig, ax = plt.subplots(figsize=(4, 4))
+                    ax.scatter(train_data_for_pca[:, 0], train_data_for_pca[:, 1], c='lightgray', alpha=0.1, label='CLIP training features')
+                    ax.scatter(x_0_pca[:, 0], x_0_pca[:, 1], c='blue', label='EEG (x₀)', s=50)
+                    ax.scatter(x_1_pca[:, 0], x_1_pca[:, 1], c='black', label='CLIP target (x₁)', s=50)
+                    ax.scatter(x_intermediates_pca[:step_idx+1, 0], x_intermediates_pca[:step_idx+1, 1], c='red', label=f'Step {step_idx}', s=50)
+                    ax.legend(loc='lower left', fontsize=6)
+                    ax.set_title('PCA Flow Trajectory')
+                    ax.axis('off')
+
+                    # Convert matplotlib fig to image
+                    buf = io.BytesIO()
+                    plt.tight_layout()
+                    plt.savefig(buf, format='png')
+                    buf.seek(0)
+                    pca_img = Image.open(buf).convert("RGB").resize((target_size[0] * 2, target_size[1]))
+                    plt.close(fig)
+
+                    # ----- Final Frame: Stacked Image + PCA Plot -----
+                    final_frame = Image.new("RGB", (target_size[0] * 2, target_size[1] * 2))
+                    final_frame.paste(combined, (0, 0))
+                    final_frame.paste(pca_img, (0, target_size[1]))
+                    gif_with_original.append(final_frame)
+
+
+                gif_buffer = io.BytesIO()
+                gif_with_original[0].save(
+                    gif_buffer,
+                    format='GIF',
+                    save_all=True,
+                    append_images=gif_with_original[1:],
+                    duration=300,
+                    loop=0
+                )
+                gif_buffer.seek(0)
+                wandb.log({f"Flow Trajectory GIF/{i}": wandb.Video(gif_buffer, format="gif")})
+
+            print(f"Logged flow reconstruction for {original_img_path} to WandB.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='EEG Transformer Training Script')
     parser.add_argument('--data_path', type=str, default="/work3/s184984/repos/EEG_Image_decode/eeg_dataset/Preprocessed_data_250Hz", help='Path to the EEG dataset')
     parser.add_argument('--model_dir', type=str, default='./models/EEG_encoder', help='Directory to save output results')    
+    parser.add_argument('--seed', type=int, default=42, help='Number of epochs')
 
     # Model params
     parser.add_argument('--device', type=str, choices=['cpu', 'gpu', 'mps'], default='gpu', help='Device to run on (cpu or gpu)')    
     parser.add_argument('--subjects', nargs='+', default=['sub-01', 'sub-02', 'sub-03', 'sub-04', 'sub-05', 'sub-06', 'sub-07', 'sub-08', 'sub-09', 'sub-10'], help='List of subject IDs (default: sub-01 to sub-10)')  
     parser.add_argument('--insubject', type=bool, default=True, help='In-subject mode or cross-subject mode')
     parser.add_argument('--alpha', type=float, default=0.90, help='alpha value to weigh the loss')
+    parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--epochs', type=int, default=40, help='Number of epochs') 
-    parser.add_argument('--flow_epochs', type=int, default=100, help='Number of epochs') 
+    parser.add_argument('--flow_epochs', type=int, default=100, help='Number of epochs')    
+    parser.add_argument('--warmup_epochs', type=int, default=0, help='Number of epochs for warmup')  
+    parser.add_argument('--use_normalization', action='store_true', help='Use normalization for training')
+    parser.add_argument('--reconstruction', action='store_true', help='Use normalization for training')
 
+    # Params
+    parser.add_argument('--skewed_timesteps', action='store_true', help='Use skewed timesteps for training')
+    parser.add_argument('--train_ATMS', action='store_true', help='train ATMS model')
+    parser.add_argument('--train_flow', action='store_true', help='train flow model')
+
+    # Data params
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--flow_batch_size', type=int, default=64, help='Batch size')
+
+    # Loss parameters
+    parser.add_argument('--loss_fn', type=str, choices=['clip', 'vicreg', 'softContrastive', 'softHybridContrastive'], default='clip', help='loss function, see loss.py for more info')
+    parser.add_argument('--uniformity_loss_weight', type=float, default=0, help='Add terms to CLIP loss for uniformity and alignment')
+    parser.add_argument('--cosine_loss_weight', type=float, default=0, help='Add cosine similarity loss to the flow model')
+    parser.add_argument('--mse_loss_weight', type=float, default=0, help='Add MSE loss to the flow model')
 
     # Model targets
     parser.add_argument('--atms_target', type=str, choices=['image', 'text'], default='image', help='Encoder type')
     parser.add_argument('--diffusion_target', type=str, choices=['image', 'text'], default='image', help='Encoder type')
 
     # Wandb
+    parser.add_argument('--logger', type=bool, default=True, help='Enable WandB logging')
     parser.add_argument('--project', type=str, default="EEG_image_reconstruction", help='WandB project name')
-    parser.add_argument('--name', type=str, default="modified_loss", help='Experiment name')
+    parser.add_argument('--name', type=str, default="flow_training", help='Experiment name')
     parser.add_argument('--entity', type=str, default="philliphoejbjerg", help='WandB entity name')
+    parser.add_argument('--log_gif_to_wandb', action='store_true', help='Log GIFs to WandB')
+    parser.add_argument('--pca', action='store_true', help='Log PCA to WandB')
 
     # Freeze ATMS
     parser.add_argument('--freeze_ATMS', action='store_true', help='Freeze ATMS model parameters')
@@ -314,7 +831,7 @@ if __name__ == '__main__':
     for sub in args.subjects:
 
         # Path for model
-        aligner_model_path = f"{args.model_dir}/{sub}/{args.name}" if args.insubject else f"{args.model_dir}/across/{args.name}"
+        aligner_model_path = f"{args.model_dir}/{args.name}/{sub}" if args.insubject else f"{args.model_dir}/{args.name}/across"
         os.makedirs(aligner_model_path, exist_ok=True)             
 
         # init wandb logger
@@ -327,141 +844,172 @@ if __name__ == '__main__':
 
         optimizer = AdamW(itertools.chain(eeg_model.parameters()), lr=args.lr)
 
-        clip_dataset, clip_loaders = load_CLIP_loaders(args, sub, device) # Load EEG dataset
-        
-        # Train and validation loop
-        best_accuracy = 0.0
-        best_epoch = 0
-        for epoch in tqdm(range(args.epochs), desc = "Epoch"):
+        clip_dataset, clip_loaders = load_ATMS_loaders(args, sub, device) # Load EEG dataset
             
-            # Train one epoch
-            train_loss, train_accuracy, average_MSE = train_clip_aligner(sub, eeg_model, clip_loaders['train'], optimizer, epoch, device, clip_dataset['train'].text_features, clip_dataset['train'].img_features, args=args)
+        # ----------- ATMS training -----------
+        if args.train_ATMS:
 
-            # Evaluate model
-            epoch_results = validate_clip_aligner(sub, eeg_model, clip_loaders['test'], device, clip_dataset['test'], args, epoch)
-            epoch_results['train_loss'], epoch_results['train_accuracy'], epoch_results['train_MSE'] = train_loss, train_accuracy, average_MSE
-            logger.log(epoch_results)
+            # Train and validation loop
+            best_accuracy = 0.0
+            best_val_loss = float('inf')
+            best_epoch = 0
+            for epoch in tqdm(range(args.epochs), desc = "Epoch"):
+                
+                # Train one epoch
+                train_loss, train_accuracy, average_MSE = train_clip_aligner(sub, eeg_model, clip_loaders['train'], optimizer, device, clip_dataset['train'].text_features, clip_dataset['train'].img_features, args=args)
 
-            # If the test accuracy of the current epoch is the best, save the model and related information
-            if epoch_results['test_accuracy'] > best_accuracy:
-                best_accuracy = epoch_results['test_accuracy']
-                best_epoch = epoch + 1
+                # Evaluate model
+                epoch_results = validate_clip_aligner(sub, eeg_model, clip_loaders['test'], device, clip_dataset['test'], args, epoch)
+                epoch_results['train_loss'], epoch_results['train_accuracy'], epoch_results['train_MSE'] = train_loss, train_accuracy, average_MSE
+                logger.log(epoch_results)
 
-                torch.save(eeg_model.state_dict(), aligner_model_path)
-                print(f"Model saved in {aligner_model_path}!, Epoch: {best_epoch}, Accuracy: {best_accuracy:.4f}, MSE: {epoch_results['test_MSE']:.4f}, Loss: {epoch_results['test_loss']:.4f}")
+                # If the test accuracy of the current epoch is the best, save the model and related information
+                if epoch_results['test_accuracy'] > best_accuracy:
+                    best_accuracy = epoch_results['test_accuracy']
+                    best_epoch = epoch + 1
 
-            print(f"Epoch {epoch + 1}/{args.epochs} - Train Loss: {epoch_results['train_loss']:.4f}, Train Accuracy: {epoch_results['train_accuracy']:.4f}, Train MSE: {epoch_results['train_MSE']:.4f}")
-            print(f"Epoch {epoch + 1}/{args.epochs} - Test Loss: {epoch_results['test_loss']:.4f}, Test Accuracy: {epoch_results['test_accuracy']:.4f}, Test MSE: {epoch_results['test_MSE']:.4f}")
-        
-        # FLOW MATCHING
+                    torch.save(eeg_model.state_dict(), f"{aligner_model_path}/best.pth")
+                    print(f"Model saved in {aligner_model_path}!, Epoch: {best_epoch}, Accuracy: {best_accuracy:.4f}, MSE: {epoch_results['test_MSE']:.4f}, Loss: {epoch_results['test_loss']:.4f}")
+
+                # if validation loss is better than before
+                if epoch_results['test_loss'] < best_val_loss:
+                    best_val_loss = epoch_results['test_loss']
+                    torch.save(eeg_model.state_dict(), f"{aligner_model_path}/best_val.pth")
+                    print(f"Model saved in {aligner_model_path}!, Epoch: {best_epoch}, Validation Loss: {best_val_loss:.4f}")
+
+                print(f"Epoch {epoch + 1}/{args.epochs} - Train Loss: {epoch_results['train_loss']:.4f}, Train Accuracy: {epoch_results['train_accuracy']:.4f}, Train MSE: {epoch_results['train_MSE']:.4f}")
+                print(f"Epoch {epoch + 1}/{args.epochs} - Test Loss: {epoch_results['test_loss']:.4f}, Test Accuracy: {epoch_results['test_accuracy']:.4f}, Test MSE: {epoch_results['test_MSE']:.4f}")
             
-        del clip_dataset
+        # ---------------- FLOW MATCHING -------------------
+        if args.train_flow or args.reconstruction:
 
-        # Loading best model (args decide whether to freeze model)
-        eeg_model = load_best_model(eeg_model, args)
+            eeg_model = load_best_model(eeg_model, sub, device, args)
 
-        # Fine-tune with Matching Flow
-        flow = FlowMatchingMLP(input_dim=1024).to(device)
-        optimizer = torch.optim.Adam(flow.parameters(), lr=1e-4)
+            # flow = ResMLPFlow(dim=1024, hidden_dim=1024, num_blocks=4).to(device)
 
-        with torch.no_grad():
-            # Add rest of pipeline..!
-            diffusion_dataset = {'train': 
-                                # Train was shown 4 times per image, test was 80 times -- this is the reason for the .repeat - however, something is still strange regardless
-                                    EmbeddingDataset( 
-                                        clip_eeg_embeddings = torch.cat([eeg_model(ele[0].unsqueeze(0).to(device), torch.tensor([extract_id_from_string(sub)], dtype=torch.long).to(device)) for ele in clip_loaders['train'].dataset], axis=0), 
-                                        clip_embeddings = clip_loaders['train'].dataset.img_features.view(1654,10,1,1024).repeat(1,1,4,1).view(-1,1024) if args.diffusion_target == 'image' else clip_loaders['train'].dataset.text_features.view(1654,1,1,1024).repeat(1,10,4,1).view(-1,1024)
-                                        ), # Corresponds to loading ViT-H-14
-                                'test': 
-                                    EmbeddingDataset(
-                                        clip_eeg_embeddings = torch.cat([eeg_model(ele[0].unsqueeze(0).to(device), torch.tensor([extract_id_from_string(sub)], dtype=torch.long).to(device)) for ele in clip_loaders['test'].dataset], axis=0), 
-                                        clip_embeddings = clip_loaders['test'].dataset.img_features if args.diffusion_target == 'image' else clip_loaders['test'].dataset.text_features # TODO: WHY ONLY 20??
-                                    ), 
-                                }   
-                 
-        diffusion_loaders = { 'train': DataLoader(diffusion_dataset['train'], batch_size=1024, shuffle=True, num_workers=0) ,
-                                'test':  DataLoader(diffusion_dataset['test'],  batch_size=1024, shuffle=False, num_workers=0)}
-        
-        import torch
-        import torch.nn.functional as F
+            flow = TransformerFlow(
+                dim=1024,
+                time_dim=128,
+                hidden_dim=2048,
+                num_heads=8,
+                num_blocks=4  # Can increase later
+            ).to(device)
+
+            from flow_matching.solver.ode_solver import ODESolver
+            solver = ODESolver(velocity_model=flow)
+
+            # probability path for the flow model
+            path = CondOTProbPath()
+
+            # ----- Normalizer -----
+            eeg_normalizer, clip_normalizer = None, None
+
+            # We need training set if training or using normalization
+            if args.train_flow or args.use_normalization:
+                flow_loaders = load_FLOW_loaders(args, sub, device, clip_loaders, eeg_model) # Load EEG dataset
+
+            if args.use_normalization or args.pca or args.train_flow:
+                # Fit normalizers
+                eeg_train_feats = flow_loaders['train'].dataset.clip_eeg_embeddings.view(-1, 1024)
+                clip_train_feats = clip_loaders['train'].dataset.img_features.view(1654, 10, 1, 1024)
+                clip_train_feats = clip_train_feats.repeat(1, 1, 4, 1).view(-1, 1024)
+
+                eeg_normalizer = Normalizer()
+                clip_normalizer = Normalizer()
+
+                eeg_normalizer.fit(eeg_train_feats)
+                clip_normalizer.fit(clip_train_feats)
+
+                # Move to GPU
+                eeg_normalizer.to(device)
+                clip_normalizer.to(device)
+
+                # Fit PCA
+                # PCA for sanity checking
+                from sklearn.decomposition import PCA
+
+                if args.use_normalization: # Normalize before fitting PCA
+                    clip_train_feats = clip_normalizer.normalize(clip_train_feats)
+
+                pca = PCA(n_components=2)
+                train_pca = pca.fit_transform(clip_train_feats.cpu().numpy()) 
+            # ----------------------
 
 
-        alpha = 1  # Balance factor between MSE and cosine similarity
+        if args.train_flow:
+            print("Training flow matching model...")
+            del clip_dataset
 
-        for epoch in range(args.flow_epochs):
-            flow.train()
-            train_mse_total = 0.0
-            train_cos_total = 0.0
-            train_batches = 0
+            # optimizer = torch.optim.Adam(flow.parameters(), 1e-4)
+            optimizer = torch.optim.AdamW(flow.parameters(), lr=3e-4, weight_decay=1e-4)
 
-            for batch in diffusion_loaders['train']:
-                x0 = batch['clip_eeg_embeddings'].to(device)
-                x1 = batch['clip_embeddings'].to(device)
-
-                t = torch.rand((x0.size(0), 1), device=device)
-                xt = (1 - t) * x0 + t * x1
-
-                v_true = x1 - x0
-                v_pred = flow(torch.cat([xt, t], dim=-1))
-
-                mse_loss = F.mse_loss(v_pred, v_true)
-                cosine_loss = 1 - F.cosine_similarity(v_pred, v_true, dim=-1).mean()
-                loss = alpha * mse_loss + (1 - alpha) * cosine_loss
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                # Track training loss
-                train_mse_total += mse_loss.item()
-                train_cos_total += cosine_loss.item()
-                train_batches += 1
-
-            # -------------------
-            # Validation
-            # -------------------
-            flow.eval()
-            val_mse_total = 0.0
-            val_cos_total = 0.0
-            val_batches = 0
+            loss_fn = nn.MSELoss()
 
             best_val_loss = float('inf')
+            best_retrieval = 0.0
 
-            with torch.no_grad():
-                for batch in diffusion_loaders['test']:
-                    x0 = batch['clip_eeg_embeddings'].to(device)
-                    x1 = batch['clip_embeddings'].to(device)
+            # Train and validate
+            for epoch in range(args.flow_epochs):
 
-                    t = torch.rand((x0.size(0), 1), device=device)
-                    xt = (1 - t) * x0 + t * x1
+                # Train one epoch
+                train_loss = train_one_epoch(epoch)
+                # Validate one epoch
+                val_results = validate_one_epoch(epoch)
 
-                    v_true = x1 - x0
-                    v_pred = flow(torch.cat([xt, t], dim=-1))
+                # Print results
+                print(f"Epoch {epoch + 1}/{args.flow_epochs}")
+                print(f"▶ Train Loss: {train_loss:.4f}")
+                print(f"▶ Val Flow Loss: {val_results['val_loss']:.4f}")
+                print(f"▶ Val Embedding MSE: {val_results['inference_mse']:.4f}")
+                print(f"▶ Val Cosine Similarity: {val_results['inference_cos']:.4f}")
+                print(f"▶ Val Retrieval Accuracy: {val_results['retrieval_acc']:.4f}")
 
-                    mse_loss = F.mse_loss(v_pred, v_true)
-                    cosine_loss = 1 - F.cosine_similarity(v_pred, v_true, dim=-1).mean()
+                plot_PCA(train_pca, val_results, pca, epoch, save_to_wandb=(val_results['val_loss'] < best_val_loss))
 
-                    val_mse_total += mse_loss.item()
-                    val_cos_total += cosine_loss.item()
-                    val_batches += 1
+                # Save model if it's the best so far
+                if val_results['val_loss'] < best_val_loss:
+                    best_val_loss = val_results['val_loss']
+                    torch.save(flow.state_dict(), f"{aligner_model_path}/flow_best_loss.pth")
+                    print(f"Saved new best model at epoch {epoch+1}: Val loss")
 
-                val_loss = alpha * (val_mse_total / val_batches) + (1 - alpha) * (val_cos_total / val_batches)
+                if val_results['retrieval_acc'] > best_retrieval:
+                    best_retrieval = val_results['retrieval_acc']
+                    torch.save(flow.state_dict(), f"{aligner_model_path}/flow_best_retrieval.pth")
+                    print(f"Saved new best model at epoch {epoch+1}: Retrieval accuracy")
 
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(flow.state_dict(), f"{args.model_dir}/{sub}/{args.name}" + "/best_flow.pth")
-                print(f"✅ Saved new best model at epoch {epoch} with val_loss = {val_loss:.4f}")
+                # Log results
+                logger.log({
+                    "flow_epoch": epoch,
+                    "flow_train/loss": train_loss,
+                    "flow_val/loss": val_results['val_loss'],
+                    "flow_val/inference_mse": val_results['inference_mse'],
+                    "flow_val/inference_cosine": val_results['inference_cos'],
+                    "flow_val/retrieval_accuracy": val_results['retrieval_acc'],
+                })
 
-            # Log results to WandB
-            epoch_results = {
-                "flow_epoch": epoch,
-                "flow_train/mse_loss": train_mse_total / train_batches,
-                "flow_train/cosine_loss": train_cos_total / train_batches,
-                "flow_val/mse_loss": val_mse_total / val_batches,
-                "flow_val/cosine_loss": val_cos_total / val_batches
-            }
 
-            logger.log(epoch_results)
-            print(f"Epoch {epoch + 1}/{args.flow_epochs} - Train MSE Loss: {train_mse_total / train_batches:.4f}, Train Cosine Loss: {train_cos_total / train_batches:.4f}")
-            print(f"Epoch {epoch + 1}/{args.flow_epochs} - Val MSE Loss: {val_mse_total / val_batches:.4f}, Val Cosine Loss: {val_cos_total / val_batches:.4f}")
+        # Reconstruct images
+        if args.reconstruction:     
+
+            from custom_pipeline_phil import Generator4Embeds
+            generator = Generator4Embeds(num_inference_steps=4, device=device, force_download=True)       
+
+            # Image reconstruction:
+            # Load the best flow model
+            best_flow_path = f"{aligner_model_path}/flow_best_loss.pth"
+            flow = load_best_flow_model(flow, best_flow_path)
+
+            flow_loaders = load_FLOW_loaders(args, sub, device, clip_loaders, eeg_model, split='test', reconstruction = True)
+
+            generate_and_log_flow_reconstructions(
+                flow_loader=flow_loaders['test'],
+                flow=flow,
+                solver=solver,
+                generator=generator,
+                args=args,
+                load_and_correct_image=load_and_correct_image,
+                eeg_normalizer = eeg_normalizer if args.use_normalization else None,
+                clip_normalizer=clip_normalizer if args.use_normalization else None,
+                pca=pca if args.pca else None,
+                train_data_for_pca=train_pca if args.pca else None,
+            )
