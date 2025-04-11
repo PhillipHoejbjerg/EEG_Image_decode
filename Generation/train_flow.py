@@ -821,7 +821,7 @@ if __name__ == '__main__':
 
 
     # Set device based on the argument
-    if args.device == 'gpu' and torch.cuda.is_available():
+    if args.device == 'cuda' and torch.cuda.is_available():
         device = torch.device(args.device)
     elif args.device == 'mps' and torch.backends.mps.is_available():
         device = torch.device(args.device)        
@@ -905,10 +905,9 @@ if __name__ == '__main__':
             eeg_normalizer, clip_normalizer = None, None
 
             # We need training set if training or using normalization
-            if args.train_flow or args.use_normalization:
-                flow_loaders = load_FLOW_loaders(args, sub, device, clip_loaders, eeg_model) # Load EEG dataset
-
             if args.use_normalization or args.pca or args.train_flow:
+
+                flow_loaders = load_FLOW_loaders(args, sub, device, clip_loaders, eeg_model) # Load EEG dataset
                 # Fit normalizers
                 eeg_train_feats = flow_loaders['train'].dataset.clip_eeg_embeddings.view(-1, 1024)
                 clip_train_feats = clip_loaders['train'].dataset.img_features.view(1654, 10, 1, 1024)
