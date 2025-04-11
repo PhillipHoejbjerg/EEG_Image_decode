@@ -850,7 +850,8 @@ if __name__ == '__main__':
         if args.train_ATMS:
 
             # Train and validation loop
-            best_accuracy = 0.0
+            best_accuracy_val = 0.0
+            best_accuracy_train = 0.0
             best_val_loss = float('inf')
             best_epoch = 0
             for epoch in tqdm(range(args.epochs), desc = "Epoch"):
@@ -864,18 +865,24 @@ if __name__ == '__main__':
                 logger.log(epoch_results)
 
                 # If the test accuracy of the current epoch is the best, save the model and related information
-                if epoch_results['test_accuracy'] > best_accuracy:
-                    best_accuracy = epoch_results['test_accuracy']
+                if epoch_results['test_accuracy'] > best_accuracy_val:
+                    best_accuracy_val = epoch_results['test_accuracy']
                     best_epoch = epoch + 1
 
                     torch.save(eeg_model.state_dict(), f"{aligner_model_path}/best.pth")
-                    print(f"Model saved in {aligner_model_path}!, Epoch: {best_epoch}, Accuracy: {best_accuracy:.4f}, MSE: {epoch_results['test_MSE']:.4f}, Loss: {epoch_results['test_loss']:.4f}")
+                    print(f"Model saved in {aligner_model_path}!, Epoch: {best_epoch}, Accuracy: {best_accuracy_val:.4f}, MSE: {epoch_results['test_MSE']:.4f}, Loss: {epoch_results['test_loss']:.4f}")
 
                 # if validation loss is better than before
                 if epoch_results['test_loss'] < best_val_loss:
                     best_val_loss = epoch_results['test_loss']
                     torch.save(eeg_model.state_dict(), f"{aligner_model_path}/best_val.pth")
                     print(f"Model saved in {aligner_model_path}!, Epoch: {best_epoch}, Validation Loss: {best_val_loss:.4f}")
+
+                # Save model with best train accuracy
+                if epoch_results['train_accuracy'] > best_accuracy_train:
+                    best_accuracy_train = epoch_results['train_accuracy']
+                    torch.save(eeg_model.state_dict(), f"{aligner_model_path}/best_train.pth")
+                    print(f"Model saved in {aligner_model_path}!, Epoch: {best_epoch}, Train Accuracy: {best_accuracy_train:.4f}, MSE: {epoch_results['train_MSE']:.4f}, Loss: {epoch_results['train_loss']:.4f}")
 
                 print(f"Epoch {epoch + 1}/{args.epochs} - Train Loss: {epoch_results['train_loss']:.4f}, Train Accuracy: {epoch_results['train_accuracy']:.4f}, Train MSE: {epoch_results['train_MSE']:.4f}")
                 print(f"Epoch {epoch + 1}/{args.epochs} - Test Loss: {epoch_results['test_loss']:.4f}, Test Accuracy: {epoch_results['test_accuracy']:.4f}, Test MSE: {epoch_results['test_MSE']:.4f}")
