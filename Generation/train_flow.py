@@ -6,7 +6,8 @@ from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
 from torchdiffeq import odeint # For flow solving
 import torch.nn as nn
-from flow_matching.path import CondOTProbPath
+from flow_matching.path import AffineProbPath, CondOTProbPath
+from flow_matching.path.scheduler import CondOTScheduler, VPScheduler, LinearVPScheduler, CosineScheduler
 
 #from flow_unet import FlowUNet1D
 #from flow_mlp import ResMLPFlow
@@ -1020,8 +1021,20 @@ if __name__ == '__main__':
             from flow_matching.solver.ode_solver import ODESolver
             solver = ODESolver(velocity_model=flow)
 
-            # probability path for the flow model
-            path = CondOTProbPath()
+            # Scheduler for the flow model
+            if args.scheduler == 'cond_ot':
+                path = CondOTProbPath()
+            elif args.scheduler == 'vp':
+                scheduler = VPScheduler()
+                path = AffineProbPath(scheduler=scheduler)
+            elif args.scheduler == 'linear_vp':
+                scheduler = LinearVPScheduler()
+                path = AffineProbPath(scheduler=scheduler)
+            elif args.scheduler == 'cosine':
+                scheduler = CosineScheduler()
+                path = AffineProbPath(scheduler=scheduler)
+            else:
+                raise ValueError(f"Unsupported scheduler type: {args.scheduler}")
 
             # ----- Normalizer -----
             eeg_normalizer, clip_normalizer = None, None
