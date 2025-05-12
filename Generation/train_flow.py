@@ -1,4 +1,3 @@
-
 import torch
 import argparse
 import os
@@ -644,8 +643,33 @@ def generate_and_log_flow_reconstructions(
     """
     flow.eval()
 
+
+    from torchvision.models.inception import inception_v3
+    inception_model = inception_v3(pretrained=True, transform_input=False).to(device)
+    inception_model.eval()
+    import lpips
+    lpips_model = lpips.LPIPS(net='alex').to(device)
+    lpips_model.eval()
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    fid_stg1 = FrechetInceptionDistance(feature=2048, normalize=True).to('cuda' if torch.cuda.is_available() else 'cpu')
+    fid_flow = FrechetInceptionDistance(feature=2048, normalize=True).to('cuda' if torch.cuda.is_available() else 'cpu')
+    import torchvision.transforms as transforms
+    transform_fid = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.ToTensor()
+    ])
+
+
+    all_stg1_metrics = []
+    all_flow_metrics = []
+
+    from metrics import calculate_inception_score, compute_lpips, compute_ssim, color_histogram_distance
+
+    from itertools import islice
+
     with torch.no_grad():
         for i, batch in enumerate(flow_loader):
+        # for i, batch in enumerate(islice(flow_loader, 10)):  # For testing
             x_0 = batch['clip_eeg_embeddings'].to(device)
             x_1 = batch['clip_embeddings'].to(device)
             original_img_path = batch['img_paths'][0]
@@ -690,22 +714,80 @@ def generate_and_log_flow_reconstructions(
                 if not isinstance(img, Image.Image):
                     img = Image.fromarray(np.array(img))
                 gif_frames.append(img)
+            
+            # ----- Calculating metrics -------
+            # --- Compute metrics for both Stage 1 and Final
+            metrics_stage1 = {}
+            metrics_final = {}
 
-            # --- Static Plot (Original, Stage 1, Final)
+            stage1_img = gif_frames[0].resize((500, 500), Image.BILINEAR)
+            final_img = gif_frames[-1].resize((500, 500), Image.BILINEAR)
+
+            metrics_stage1['IS'] = calculate_inception_score(stage1_img, inception_model, device=device)
+            metrics_stage1['cos_sim'] = F.cosine_similarity(x_0, x_1, dim=-1).item()
+            metrics_stage1['lpips'] = compute_lpips(original_img, stage1_img, lpips_model=lpips_model, device=device)
+            metrics_stage1['ssim'] = compute_ssim(original_img, gif_frames[0])
+            metrics_stage1['color_dist'] = color_histogram_distance(original_img, gif_frames[0])
+
+            metrics_final['IS'] = calculate_inception_score(final_img, inception_model, device=device)
+            metrics_final['cos_sim'] = F.cosine_similarity(x_intermediates[-1], x_1, dim=-1).item()
+            metrics_final['lpips'] = compute_lpips(original_img, final_img, lpips_model=lpips_model, device=device)
+            metrics_final['ssim'] = compute_ssim(original_img, gif_frames[-1])
+            metrics_final['color_dist'] = color_histogram_distance(original_img, gif_frames[-1])
+
+            # Optionally add to a list for logging/export
+            all_stg1_metrics.append(metrics_stage1)
+            all_flow_metrics.append(metrics_final)
+
+            # FID update
+            img_real = transform_fid(original_img).unsqueeze(0).to('cuda' if torch.cuda.is_available() else 'cpu')
+            img_stg1 = transform_fid(gif_frames[0]).unsqueeze(0).to('cuda' if torch.cuda.is_available() else 'cpu')
+            img_flow = transform_fid(gif_frames[-1]).unsqueeze(0).to('cuda' if torch.cuda.is_available() else 'cpu')
+
+            fid_stg1.update(img_real, real=True)
+            fid_stg1.update(img_stg1, real=False)
+            fid_flow.update(img_real, real=True)
+            fid_flow.update(img_flow, real=False)
+
+            # --- Plotting
             fig, axs = plt.subplots(1, 3, figsize=(12, 4))
             axs[0].imshow(original_img)
             axs[0].set_title("Original")
             axs[0].axis('off')
 
-            axs[1].imshow(np.array(gif_frames[0]))
+            axs[1].imshow(gif_frames[0])
             axs[1].set_title("Stage 1")
             axs[1].axis('off')
 
-            axs[2].imshow(np.array(gif_frames[-1]))
+            axs[2].imshow(gif_frames[-1])
             axs[2].set_title("Flow-Reconstructed")
             axs[2].axis('off')
 
-            fig.suptitle(original_img_path.split("/")[-1].replace(".jpg", ""), fontsize=14)
+            def format_metrics(m):
+                keys = list(m.keys())
+                lines = []
+                for i in range(0, len(keys), 2):
+                    k1 = keys[i]
+                    v1 = f"{m[k1]:.4f}"
+                    if i + 1 < len(keys):
+                        k2 = keys[i + 1]
+                        v2 = f"{m[k2]:.4f}"
+                        lines.append(f"{k1}: {v1}    {k2}: {v2}")
+                    else:
+                        lines.append(f"{k1}: {v1}")
+                return "\n".join(lines)
+
+            axs[1].text(0.5, -0.02, format_metrics(metrics_stage1), transform=axs[1].transAxes,
+                        fontsize=10, ha='center', va='top', wrap=True)
+            axs[2].text(0.5, -0.02, format_metrics(metrics_final), transform=axs[2].transAxes,
+                        fontsize=10, ha='center', va='top', wrap=True)
+
+            # Plot title
+            title = original_img_path.split("/")[-1].replace(".jpg", "")
+            fig.suptitle(f"{title}", fontsize=14)
+            #fig.subplots_adjust(top=0.85, bottom=0.1)
+            fig.tight_layout()
+
             wandb.log({f"Flow Reconstruction/{i}": wandb.Image(fig)})
             plt.close(fig)
 
@@ -760,8 +842,39 @@ def generate_and_log_flow_reconstructions(
                 )
                 gif_buffer.seek(0)
                 wandb.log({f"Flow Trajectory GIF/{i}": wandb.Video(gif_buffer, format="gif")})
+                
 
-            print(f"Logged flow reconstruction for {original_img_path} to WandB.")
+    def average_metrics(metric_list):
+        return {k: np.mean([m[k] for m in metric_list]) for k in metric_list[0].keys()}
+        
+    avg_stage1 = average_metrics(all_stg1_metrics)
+    avg_flow = average_metrics(all_flow_metrics)
+
+    # Add FID scores
+    avg_stage1['FID'] = fid_stg1.compute().item()
+    avg_flow['FID'] = fid_flow.compute().item()
+
+    for metric in avg_stage1:
+        # Data format: [ [group, value] ]
+        data = [
+            ["Stage 1", avg_stage1[metric]],
+            ["Flow", avg_flow[metric]]
+        ]
+
+        # Create table
+        table = wandb.Table(data=data, columns=["group", "value"])
+
+        # Log individual bar chart for this metric
+        wandb.log({
+            f"Metric/{metric}": wandb.plot.bar(
+                table,
+                "group",   # x-axis: Stage 1 vs Flow
+                "value",   # y-axis: metric value
+                title=f"{metric} Comparison"
+            )
+        })
+
+    print(f"Logged flow reconstruction for {original_img_path} to WandB.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='EEG Transformer Training Script')
