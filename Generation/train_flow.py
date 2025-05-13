@@ -896,6 +896,8 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_epochs', type=int, default=0, help='Number of epochs for warmup')  
     parser.add_argument('--use_normalization', action='store_true', help='Use normalization for training')
     parser.add_argument('--reconstruction', action='store_true', help='Use normalization for training')
+    # flow path scheduler
+    parser.add_argument('--scheduler', type=str, choices=['cond_ot', 'vp', 'linear_vp', 'cosine'], default='linear', help='Scheduler for Flow path')
 
     # Params
     parser.add_argument('--skewed_timesteps', action='store_true', help='Use skewed timesteps for training')
@@ -1083,7 +1085,7 @@ if __name__ == '__main__':
             best_retrieval = 0.0
 
             # Train and validate
-            for epoch in range(args.flow_epochs):
+            for epoch in tqdm(range(args.flow_epochs), desc = "Flow Epoch"):
 
                 # Train one epoch
                 train_loss = train_one_epoch(epoch)
