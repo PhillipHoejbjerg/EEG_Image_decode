@@ -922,6 +922,7 @@ if __name__ == '__main__':
     parser.add_argument('--logger', type=bool, default=True, help='Enable WandB logging')
     parser.add_argument('--project', type=str, default="EEG_image_reconstruction", help='WandB project name')
     parser.add_argument('--name', type=str, default="flow_training", help='Experiment name')
+    parser.add_argument('--flow_name', type=str, default="flow_training", help='Experiment name')
     parser.add_argument('--entity', type=str, default="philliphoejbjerg", help='WandB entity name')
     parser.add_argument('--log_gif_to_wandb', action='store_true', help='Log GIFs to WandB')
     parser.add_argument('--pca', action='store_true', help='Log PCA to WandB')
@@ -1105,12 +1106,12 @@ if __name__ == '__main__':
                 # Save model if it's the best so far
                 if val_results['val_loss'] < best_val_loss:
                     best_val_loss = val_results['val_loss']
-                    torch.save(flow.state_dict(), f"{aligner_model_path}/flow_best_loss.pth")
+                    torch.save(flow.state_dict(), f"{aligner_model_path}/{args.flow_name}/flow_best_loss.pth")
                     print(f"Saved new best model at epoch {epoch+1}: Val loss")
 
                 if val_results['retrieval_acc'] > best_retrieval:
                     best_retrieval = val_results['retrieval_acc']
-                    torch.save(flow.state_dict(), f"{aligner_model_path}/flow_best_retrieval.pth")
+                    torch.save(flow.state_dict(), f"{aligner_model_path}/{args.flow_name}/flow_best_retrieval.pth")
                     print(f"Saved new best model at epoch {epoch+1}: Retrieval accuracy")
 
                 # Log results
@@ -1132,7 +1133,7 @@ if __name__ == '__main__':
 
             # Image reconstruction:
             # Load the best flow model
-            best_flow_path = f"{aligner_model_path}/flow_best_loss.pth"
+            best_flow_path = f"{aligner_model_path}/{args.flow_name}/flow_best_loss.pth"
             flow = load_best_flow_model(flow, best_flow_path)
 
             flow_loaders = load_FLOW_loaders(args, sub, device, clip_loaders, eeg_model, split='test', reconstruction = True)
