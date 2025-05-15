@@ -1074,6 +1074,9 @@ if __name__ == '__main__':
 
 
         if args.train_flow:
+            # Make folder for flow model
+            os.makedirs(f"{aligner_model_path}/{args.flow_name}", exist_ok=True)
+
             print("Training flow matching model...")
             del clip_dataset
 
