@@ -55,7 +55,7 @@ class Config:
         self.e_layers = 1                  # Number of encoder layers
         self.d_ff = 256                    # Dimension of the feedforward network
         self.activation = 'gelu'           # Activation function
-        self.enc_in = 63                   # Encoder input dimension (example value)
+        self.enc_in = 27                   # Encoder input dimension (example value)
 
 class iTransformer(nn.Module):
     def __init__(self, configs, joint_train=False,  num_subjects=10):
@@ -64,6 +64,7 @@ class iTransformer(nn.Module):
         self.seq_len = configs.seq_len
         self.pred_len = configs.pred_len
         self.output_attention = configs.output_attention
+        self.enc_in = configs.enc_in
         # Embedding
         self.enc_embedding = DataEmbedding(configs.seq_len, configs.d_model, configs.embed, configs.freq, configs.dropout, joint_train=False, num_subjects=num_subjects)
         # Encoder
@@ -87,20 +88,22 @@ class iTransformer(nn.Module):
         # Embedding
         enc_out = self.enc_embedding(x_enc, x_mark_enc, subject_ids)
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
-        enc_out = enc_out[:, :63, :]      
+        enc_out = enc_out[:, :self.enc_in, :]      
         # print("enc_out", enc_out.shape)
         return enc_out
 
 class PatchEmbedding(nn.Module):
-    def __init__(self, emb_size=40):
+    def __init__(self, emb_size=40, enc_in=63):
         super().__init__()
+
+        self.enc_in = enc_in
         # Revised from ShallowNet
         self.tsconv = nn.Sequential(
             nn.Conv2d(1, 40, (1, 25), stride=(1, 1)),
             nn.AvgPool2d((1, 51), (1, 5)),
             nn.BatchNorm2d(40),
             nn.ELU(),
-            nn.Conv2d(40, 40, (63, 1), stride=(1, 1)),
+            nn.Conv2d(40, 40, (self.enc_in, 1), stride=(1, 1)),
             nn.BatchNorm2d(40),
             nn.ELU(),
             nn.Dropout(0.5),
@@ -141,9 +144,9 @@ class FlattenHead(nn.Sequential):
         return x
 
 class Enc_eeg(nn.Sequential):
-    def __init__(self, emb_size=40, **kwargs):
+    def __init__(self, emb_size=40, enc_in=63, **kwargs):
         super().__init__(
-            PatchEmbedding(emb_size),
+            PatchEmbedding(emb_size, enc_in),
             FlattenHead()
         )
 
@@ -165,7 +168,7 @@ class ATMS(nn.Module):
         default_config = Config()
         self.encoder = iTransformer(default_config)   
         self.subject_wise_linear = nn.ModuleList([nn.Linear(default_config.d_model, sequence_length) for _ in range(num_subjects)])
-        self.enc_eeg = Enc_eeg()
+        self.enc_eeg = Enc_eeg(enc_in = default_config.enc_in)
         self.proj_eeg = Proj_eeg()        
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.args = args

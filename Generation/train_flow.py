@@ -801,19 +801,19 @@ def generate_and_log_flow_reconstructions(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='EEG Transformer Training Script')
-    parser.add_argument('--data_path', type=str, default="/work3/s184984/repos/EEG_Image_decode/eeg_dataset/Preprocessed_data_250Hz", help='Path to the EEG dataset')
+    parser.add_argument('--data_path', type=str, default="/home/ext_pchho_dtu_dk/EEG_Image_decode/eeg_dataset/Preprocessed_data_250Hz", help='Path to the EEG dataset')
     parser.add_argument('--model_dir', type=str, default='./models/EEG_encoder', help='Directory to save output results')    
-    parser.add_argument('--seed', type=int, default=42, help='Number of epochs')
+    parser.add_argument('--seed', type=int, default=200399, help='Random seed')
 
     parser.add_argument('--pth_name', type=str, default='best', help='Name of the ATMS model to load')
 
     # Model params
     parser.add_argument('--device', type=str, choices=['cpu', 'cuda', 'mps'], default='gpu', help='Device to run on (cpu or gpu)')    
-    parser.add_argument('--subjects', nargs='+', default=['sub-01', 'sub-02', 'sub-03', 'sub-04', 'sub-05', 'sub-06', 'sub-07', 'sub-08', 'sub-09', 'sub-10'], help='List of subject IDs (default: sub-01 to sub-10)')  
+    parser.add_argument('--subjects', nargs='+', default=['sub-00', 'sub-01', 'sub-02', 'sub-03', 'sub-04', 'sub-05', 'sub-06', 'sub-07', 'sub-08', 'sub-09', 'sub-10'], help='List of subject IDs (default: sub-01 to sub-10)')  
     parser.add_argument('--insubject', type=bool, default=True, help='In-subject mode or cross-subject mode')
     parser.add_argument('--alpha', type=float, default=0.90, help='alpha value to weigh the loss')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
-    parser.add_argument('--epochs', type=int, default=40, help='Number of epochs') 
+    parser.add_argument('--epochs', type=int, default=300, help='Number of epochs') 
     parser.add_argument('--flow_epochs', type=int, default=100, help='Number of epochs')    
     parser.add_argument('--warmup_epochs', type=int, default=0, help='Number of epochs for warmup')  
     parser.add_argument('--use_normalization', action='store_true', help='Use normalization for training')

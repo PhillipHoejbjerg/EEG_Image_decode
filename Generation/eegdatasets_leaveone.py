@@ -25,7 +25,7 @@ vlmodel, preprocess_train, feature_extractor = open_clip.create_model_and_transf
 import json
 
 # Load the configuration from the JSON file
-config_path = "data_config.json"
+config_path = "/home/ext_pchho_dtu_dk/EEG_Image_decode/Generation/data_config.json"
 with open(config_path, "r") as config_file:
     config = json.load(config_file)
 
@@ -40,7 +40,8 @@ class EEGDataset():
     """
     subjects = ['sub-01', 'sub-02', 'sub-05', 'sub-04', 'sub-03', 'sub-06', 'sub-07', 'sub-08', 'sub-09', 'sub-10']
     """
-    def __init__(self, data_path, exclude_subject=None, subjects=None, train=True, time_window=[0, 1.0], classes = None, pictures = None, device = torch.device('cuda')):
+    def __init__(self, data_path, exclude_subject=None, subjects=None, train=True, time_window=[0, 1.0], classes = None, pictures = None, device = torch.device('cuda'), test_repetition_method = 'average'):
+        
         self.data_path = data_path
         self.train = train
         self.subject_list = os.listdir(data_path)
@@ -52,6 +53,7 @@ class EEGDataset():
         self.pictures = pictures
         self.exclude_subject = exclude_subject
         self.device = device
+        self.test_repetition_method = test_repetition_method
 
         # assert any subjects in subject_list
         assert any(sub in self.subject_list for sub in self.subjects)
@@ -221,7 +223,15 @@ class EEGDataset():
                         preprocessed_eeg_data_class = preprocessed_eeg_data[start_index:start_index+samples_per_class]
                         # print("preprocessed_eeg_data_class", preprocessed_eeg_data_class.shape)
                         labels = torch.full((samples_per_class,), i, dtype=torch.long).detach()  # Add class labels
-                        preprocessed_eeg_data_class = torch.mean(preprocessed_eeg_data_class.squeeze(0), 0)
+
+
+                        #TODO: Remember!! This was previously averaged over repetition dimension, something that was not done in training!!!!
+                        if self.test_repetition_method == 'average':
+                            preprocessed_eeg_data_class = torch.mean(preprocessed_eeg_data_class.squeeze(0), 0)
+
+                        elif self.test_repetition_method == 'first':
+                            preprocessed_eeg_data_class = preprocessed_eeg_data_class.squeeze(0)[0]
+
                         # print("preprocessed_eeg_data_class", preprocessed_eeg_data_class.shape)
                         data_list.append(preprocessed_eeg_data_class)
                         label_list.append(labels)  # Add labels to the label list

@@ -12,6 +12,46 @@ from scipy.spatial import distance
 import random
 import torch
 
+def load_and_correct_image(image_path):
+    """
+    Loads an image, corrects its orientation using EXIF data, converts to RGB format, 
+    and center crops it to the largest possible square.
+    
+    Args:
+        image_path (str): Path to the image file.
+    
+    Returns:
+        PIL.Image.Image: A corrected and square-cropped PIL Image object.
+    """
+    with Image.open(image_path) as image:
+        # Correct orientation using EXIF metadata if available
+        if hasattr(image, "_getexif") and image._getexif():
+            exif = image._getexif()
+            orientation_key = 274  # Key for orientation tag
+            if exif and orientation_key in exif:
+                orientation = exif[orientation_key]
+                # Apply transformations based on orientation value
+                if orientation == 3:
+                    image = image.rotate(180, expand=True)
+                elif orientation == 6:
+                    image = image.rotate(270, expand=True)
+                elif orientation == 8:
+                    image = image.rotate(90, expand=True)
+        
+        # Convert to RGB to ensure consistent processing
+        image = image.convert("RGB")
+        
+        # Perform center square cropping
+        width, height = image.size
+        min_dim = min(width, height)
+        left = (width - min_dim) // 2
+        top = (height - min_dim) // 2
+        right = (width + min_dim) // 2
+        bottom = (height + min_dim) // 2
+        image = image.crop((left, top, right, bottom))
+    
+    return image
+
 def set_seed(seed):
     # Set the seed for Python's built-in random module
     random.seed(seed)

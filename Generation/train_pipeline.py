@@ -28,6 +28,7 @@ from sklearn.metrics import confusion_matrix
 from torch.utils.data import DataLoader, Dataset
 import random
 from util import wandb_logger
+import wandb
 from braindecode.models import EEGNetv4, ATCNet, EEGConformer, EEGITNet, ShallowFBCSPNet
 import csv
 from torch import Tensor
@@ -384,6 +385,85 @@ def load_and_freeze_best_model(eeg_model, args):
 
     return eeg_model
 
+from utils_phil import extract_id_from_string, set_seed, load_and_correct_image
+from PIL import Image, ImageDraw
+
+def generate_imgs(args, stage1_model, sub, device):
+    # load EEG to Stage 1 model
+    stage1_model = load_and_freeze_best_model(stage1_model, args)
+
+    # Load Stage 1 -> Stage 2 model
+    if args.train_diffusion_prior:
+        diffusion_prior = DiffusionPriorUNet(cond_dim=1024, dropout=0.1)
+        pipe = Pipe(diffusion_prior, device=device)
+        stage2_model_save_path = f"{args.model_dir}/{args.atms_target}_{args.diffusion_target}_Diffusion_prior/{sub}/{args.name}" 
+        stage2_model_save_path = f"{stage2_model_save_path}/best.pth"
+        pipe.diffusion_prior.load_state_dict(torch.load(stage2_model_save_path, map_location=device)) 
+
+    # Load Stable Diffusion
+    generator = Generator4Embeds(num_inference_steps=4, device=device, force_download=True)
+
+    # Load dataset and loaders
+    test_dataset = EEGDataset(args.data_path, subjects=[sub], train=False, device=device)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True, num_workers=0, drop_last=True)
+
+    with torch.no_grad():
+        for batch_idx, (eeg_data, labels, text, text_features, img, img_features) in enumerate(test_loader):
+
+            print(f"Generating batch: {batch_idx}")
+
+            # Load the original image from the file path
+            original_img_path = img[0]  # Assuming batch size is 1, get the first path in img tuple
+            filename = f"comparison_{batch_idx}_{'___'.join(original_img_path.split('/')[-2:]).split('.')[0]}.png"
+            
+            eeg_data = eeg_data.to(device)
+            labels = labels.to(device) 
+            
+            try:
+                original_img = load_and_correct_image(original_img_path)
+            except Exception as e:
+                print(f"Failed to load image at {original_img_path}: {e}")
+                # continue
+
+            # Get model outputs
+            subject_ids = torch.full((eeg_data.size(0),), extract_id_from_string(sub), dtype=torch.long).to(device)
+            # EEG -> Stage 1
+            stage1_emb = stage1_model(eeg_data, subject_ids).to(device)
+
+            if args.train_diffusion_prior:
+                # Stage 1 -> Stage 2
+                stage2_emb = pipe.generate(c_embeds = stage1_emb, num_inference_steps=50, guidance_scale=5.0).to(dtype=torch.float16).to(device)
+
+            # Plotting
+            fig, axs = plt.subplots(1, 2 + args.train_diffusion_prior, figsize=(4 * (2 + args.train_diffusion_prior), 4))
+            axs[0].imshow(original_img)
+            axs[0].set_title("Original")
+            axs[0].axis('off')
+
+            # Plot embeddings
+            embeddings = [stage1_emb]
+            if args.train_diffusion_prior:
+                embeddings.append(stage2_emb)
+
+            # Generate images through Stable Diffusion
+            for ax_idx, embedding in enumerate(embeddings):
+                set_seed(args.seed)
+                img = generator.generate(image_embeds=embedding, text_prompt="")
+                if not isinstance(img, Image.Image):
+                    img = Image.fromarray(np.array(img))
+                    
+                    axs[ax_idx + 1].imshow(img)
+                    axs[ax_idx + 1].set_title(f"Stage {ax_idx + 1}")
+                    axs[ax_idx + 1].axis('off')
+
+            # Plot title
+            title = original_img_path.split("/")[-1].replace(".jpg", "")
+            fig.suptitle(f"{title}", fontsize=14)
+            #fig.subplots_adjust(top=0.85, bottom=0.1)
+            fig.tight_layout()
+
+            wandb.log({f"Reconstructions/{batch_idx}": wandb.Image(fig)})
+            plt.close(fig)    
 
 if __name__ == '__main__':
 
@@ -403,7 +483,7 @@ if __name__ == '__main__':
 
     # Use argparse to parse the command-line arguments
     parser = argparse.ArgumentParser(description='EEG Transformer Training Script')
-    parser.add_argument('--data_path', type=str, default="/work3/s184984/repos/EEG_Image_decode/eeg_dataset/Preprocessed_data_250Hz", help='Path to the EEG dataset')
+    parser.add_argument('--data_path', type=str, default="/Users/pchho/Documents/repos/EEG_Image_decode/eeg_dataset_orig/Preprocessed_data_250Hz", help='Path to the EEG dataset')
     parser.add_argument('--output_dir', type=str, default='./outputs/contrast', help='Directory to save output results')    
     parser.add_argument('--model_dir', type=str, default='./models/EEG_encoder', help='Directory to save output results')    
     parser.add_argument('--experiment_name', type=str, default='', help='Directory to save output results')    
@@ -424,7 +504,8 @@ if __name__ == '__main__':
     parser.add_argument('--encoder_type', type=str, default='ATMS', help='Encoder type')
     parser.add_argument('--atms_target', type=str, choices=['image', 'text'], default='image', help='Encoder type')
     parser.add_argument('--diffusion_target', type=str, choices=['image', 'text'], default='image', help='Encoder type')
-    parser.add_argument('--subjects', nargs='+', default=['sub-01', 'sub-02', 'sub-03', 'sub-04', 'sub-05', 'sub-06', 'sub-07', 'sub-08', 'sub-09', 'sub-10'], help='List of subject IDs (default: sub-01 to sub-10)')    
+    #parser.add_argument('--subjects', nargs='+', default=['sub-01', 'sub-02', 'sub-03', 'sub-04', 'sub-05', 'sub-06', 'sub-07', 'sub-08', 'sub-09', 'sub-10'], help='List of subject IDs (default: sub-01 to sub-10)')    
+    parser.add_argument('--subjects', nargs='+', default=['sub-01'], help='List of subject IDs (default: sub-01 to sub-10)')    
     parser.add_argument('--alpha', type=float, default=0.90, help='alpha value to weigh the loss')
 
     parser.add_argument('--alpha_scheduler', action='store_true', help='Slowly transitions from CLIP loss to MSE')
@@ -432,6 +513,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--train_EEG_aligner', action='store_true', help='Trains the EEG embedder')
     parser.add_argument('--train_diffusion_prior', action='store_true', help='Trains the diffusion prior to the pipeline')
+    parser.add_argument('--generate_images', action='store_true', help='Generates images from the trained model')
+    parser.add_argument('--test_repetition_method', type=str, choices=['average', 'first'], default='average', help='Method to use for testing repetition')
 
     # Loss
     parser.add_argument('--loss_fn', type=str, choices=['clip', 'vicreg', 'softContrastive', 'softHybridContrastive'], default='clip', help='loss function, see loss.py for more info')
@@ -504,12 +587,12 @@ if __name__ == '__main__':
 
         # Load datasets 
         if args.insubject: # per subject
-            clip_dataset = {'train': EEGDataset(args.data_path, subjects=[sub], train=True, device=device),
-                            'test':  EEGDataset(args.data_path, subjects=[sub], train=False, device=device)}
+            clip_dataset = {'test':  EEGDataset(args.data_path, subjects=[sub], train=False, device=device, test_repetition_method = args.test_repetition_method),
+                            'train': EEGDataset(args.data_path, subjects=[sub], train=True, device=device, test_repetition_method = args.test_repetition_method)}
         else:
             # Leave one subject out
-            clip_dataset = {'train': EEGDataset(args.data_path, exclude_subject=sub, subjects=args.subjects, train=True),
-                            'test':  EEGDataset(args.data_path, exclude_subject=sub, subjects=args.subjects, train=False)}
+            clip_dataset = {'train': EEGDataset(args.data_path, exclude_subject=sub, subjects=args.subjects, train=True, test_repetition_method = args.test_repetition_method),
+                            'test':  EEGDataset(args.data_path, exclude_subject=sub, subjects=args.subjects, train=False, test_repetition_method = args.test_repetition_method)}
 
         # Loaders
         clip_loaders = {'train': DataLoader(clip_dataset['train'], batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True),
@@ -604,6 +687,14 @@ if __name__ == '__main__':
             del diffusion_dataset
 
             train_diffusion_prior(sub, diffusion_prior, diffusion_loaders['train'], device, args, logger=logger)
+
+
+        if args.generate_images:
+            # Generate images
+            # instantiate model
+            eeg_model = ATMS(args = args) # globals()[args.encoder_type]()
+            eeg_model.to(device)
+            generate_imgs(args, eeg_model, sub, device)
 
         logger.finish()
 
